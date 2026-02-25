@@ -6,3 +6,4 @@ __pycache__/
 ~/.link-capture/
 *.db
 .env
+unified_inbox.json
