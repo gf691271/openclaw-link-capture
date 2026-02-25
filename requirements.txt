@@ -1,0 +1,12 @@
+# link-capture requirements
+# All fetchers use stdlib except YouTube which needs system tools
+
+# Optional: faster web scraping (falls back to stdlib urllib if not present)
+# beautifulsoup4>=4.12.0
+
+# System tools (install via Homebrew or package manager):
+#   brew install yt-dlp          # YouTube download
+#   brew install openai-whisper  # audio transcription (or: pip install openai-whisper)
+#
+# No pip packages required for core functionality.
+# stdlib only: urllib, json, sqlite3, subprocess, re, hashlib, tempfile
