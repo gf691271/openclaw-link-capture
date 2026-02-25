@@ -24,7 +24,10 @@ def fetch(url: str) -> dict:
     author = tweet.get("author", {})
 
     # handle X Articles (long-form)
-    content = tweet.get("text", "")
+    # raw_text is a dict {"text": "...", "facets": []} for media-only tweets
+    raw = tweet.get("raw_text", "")
+    raw_str = raw.get("text", "") if isinstance(raw, dict) else str(raw)
+    content = tweet.get("text", "") or raw_str
     if tweet.get("note_tweet"):
         content = tweet.get("note_tweet", {}).get("text", content)
 
@@ -40,6 +43,9 @@ def fetch(url: str) -> dict:
         media_urls.append(m.get("url", ""))
     for m in tweet.get("media", {}).get("videos", []):
         media_urls.append(m.get("url", ""))
+
+    # media-only tweet: flag it clearly
+    is_media_only = bool(media_urls) and not content.strip()
 
     return {
         "url": url,
