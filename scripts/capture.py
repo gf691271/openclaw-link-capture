@@ -1,220 +1,208 @@
 #!/usr/bin/env python3
 """
-link-capture — URL knowledge capture pipeline
-Supports: Twitter/X, YouTube (subtitles + Whisper), web articles
+OpenClaw Link Capture — simplified v2
+Uses x-reader for fetching, Nowledge Mem for storage.
 
 Usage:
   python3 capture.py --url "https://x.com/user/status/123"
-  python3 capture.py --url "https://youtube.com/watch?v=abc" --whisper-model small
+  python3 capture.py --url "https://youtube.com/watch?v=abc"
   python3 capture.py --url "https://example.com/article"
-  python3 capture.py --url "..." --backend sqlite --db ~/my-captures.db
-  python3 capture.py --url "..." --backend nmem         # for OpenClaw Nowledge Mem
-  python3 capture.py --url "..." --backend both         # save to both
-  python3 capture.py --json                             # output JSON only (for AI agents)
+  python3 capture.py --url "..." --json    # machine-readable output for AI agents
 """
-import argparse, json, sys, re, os
+import argparse, json, os, subprocess, sys, tempfile, re, hashlib
 from pathlib import Path
 
-# add scripts/ to path so we can import siblings
-sys.path.insert(0, str(Path(__file__).parent))
+X_READER = "/Users/frank/.local/bin/x-reader"
 
-from fetchers import twitter, youtube, web
-from storage  import sqlite as sqlite_backend, nmem as nmem_backend
+# ── URL normalisation ─────────────────────────────────────────────────────────
 
-# ── URL router ────────────────────────────────────────────────────────────────
+def normalise_url(url: str) -> str:
+    """Canonicalise Twitter /i/status/ → standard form."""
+    url = url.strip()
+    # x.com/i/status/ID → x.com/i/status/ID (keep as-is; dedup uses semantics)
+    # t.co short links are resolved by x-reader automatically
+    return url
 
-def fetch(url: str, whisper_model: str = "base") -> dict:
-    """Route URL to the right fetcher and return a normalized capture dict."""
-    if twitter.is_twitter_url(url):
-        return twitter.fetch(url)
-    if youtube.is_youtube_url(url):
-        return youtube.fetch(url, whisper_model=whisper_model)
-    if web.is_web_url(url):
-        return web.fetch(url)
-    raise ValueError(f"Unsupported URL: {url}")
+def detect_type(url: str) -> str:
+    if re.search(r"(twitter\.com|x\.com)", url): return "twitter"
+    if re.search(r"(youtube\.com/watch|youtu\.be/|youtube\.com/shorts)", url): return "youtube"
+    return "web"
 
-# ── summary generator (standalone, no LLM required) ──────────────────────────
+# ── fetch via x-reader ────────────────────────────────────────────────────────
 
-def auto_summary(capture: dict, max_len: int = 400) -> str:
+def fetch(url: str) -> dict:
     """
-    Generate a summary without an LLM.
-    Good enough for indexing; AI agents can enrich this when calling from OpenClaw.
+    Run x-reader and return the structured UnifiedContent dict.
+    Uses a temp file as inbox to avoid polluting the shared inbox.
     """
-    url_type = capture.get("url_type", "web")
-    content  = capture.get("content", "")
-    stats    = capture.get("stats", {})
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
+        tmp_path = tmp.name
 
-    parts = []
+    try:
+        env = {**os.environ, "INBOX_FILE": tmp_path}
+        result = subprocess.run(
+            [X_READER, url],
+            capture_output=True, text=True,
+            timeout=90, env=env
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"x-reader failed: {result.stderr[:200]}")
+
+        raw = json.loads(Path(tmp_path).read_text(encoding="utf-8"))
+        if not raw:
+            raise RuntimeError("x-reader returned empty result")
+
+        item = raw[-1]  # most recent entry
+        return item
+
+    finally:
+        try: os.unlink(tmp_path)
+        except: pass
+
+# ── importance scoring ────────────────────────────────────────────────────────
+
+def score_importance(item: dict) -> float:
+    meta = item.get("metadata", {}) or {}
+    url_type = item.get("source_type", "web")
+
+    views     = meta.get("views", 0) or 0
+    bookmarks = meta.get("bookmarks", 0) or 0
+    likes     = meta.get("likes", 0) or 0
 
     if url_type == "twitter":
-        sn = capture.get("screen_name", "")
-        parts.append(f"Tweet by @{sn}:" if sn else "Tweet:")
-        # first 200 chars of content
-        parts.append(content[:200])
-        if stats:
-            parts.append(
-                f"[{stats.get('views',0):,} views · "
-                f"{stats.get('likes',0):,} likes · "
-                f"{stats.get('bookmarks',0):,} bookmarks]"
-            )
-        qt = capture.get("quote_tweet")
-        if qt:
-            parts.append(f"Quoting @{qt['screen_name']}: {qt['text'][:100]}")
+        if views > 500_000 or bookmarks > 5000: return 0.9
+        if views > 100_000 or bookmarks > 2000 or likes > 5000: return 0.8
+        if views > 10_000  or likes > 500: return 0.65
+        return 0.5
+    if url_type == "youtube":
+        if views > 1_000_000: return 0.8
+        if views > 100_000:   return 0.65
+        return 0.5
+    return 0.5
 
+# ── auto-labelling ────────────────────────────────────────────────────────────
+
+TOPIC_MAP = {
+    "openclaw":          ["openclaw","claude","anthropic","claw"],
+    "ai-agents":         ["agent","agentic","llm","gpt","mcp","multi-agent"],
+    "robotics":          ["robot","humanoid","unitree","embodied"],
+    "real-estate":       ["real estate","property","zealty","mls","housing","mortgage"],
+    "school-district":   ["school","district","iusd","irvine","university high"],
+    "immigration":       ["visa","green card","eb-5","immigration","i-526"],
+    "content-strategy":  ["content","strategy","growth","audience","viral","hook"],
+    "engineering":       ["scraper","python","api","pipeline","etl","github"],
+    "north-shore-crossing": ["lions gate","ironworkers","bridge","north shore"],
+    "twitter":           ["twitter","tweet","x.com"],
+}
+
+def auto_labels(item: dict) -> list:
+    text = (
+        (item.get("title") or "") + " " +
+        (item.get("content") or "")[:500]
+    ).lower()
+
+    labels = [f"source-{item.get('source_type','web')}"]
+    for label, keywords in TOPIC_MAP.items():
+        if any(kw in text for kw in keywords):
+            labels.append(label)
+    return labels[:6]
+
+# ── nmem payload ──────────────────────────────────────────────────────────────
+
+def build_nmem_payload(item: dict) -> dict:
+    url_type   = item.get("source_type", "web")
+    meta       = item.get("metadata", {}) or {}
+    title      = item.get("title", "") or item.get("url", "")
+    url        = item.get("url", "")
+    content    = item.get("content", "") or ""
+    # x-reader uses "@i" for /i/status/ URLs — extract real author from content footer
+    author     = item.get("source_name", "")
+    content_footer = re.search(r"@(\w+)\)\s*\w+ \d+, \d{4}$", content)
+    if author in ("@i", "i", "") and content_footer:
+        author = "@" + content_footer.group(1)
+    fetched_at = item.get("fetched_at", "")[:10]
+
+    # title formatting
+    if url_type == "twitter" and author:
+        clean_author = author.lstrip("@")
+        display_title = f"[@{clean_author}] {title[:55]}"
     elif url_type == "youtube":
-        ch = capture.get("channel") or capture.get("author","")
-        dur = capture.get("duration_secs", 0)
-        method = capture.get("transcript_method","")
-        parts.append(f"YouTube video by {ch} ({dur//60} min) [{method}]")
-        transcript = capture.get("transcript", "")
-        if transcript:
-            parts.append(transcript[:300])
-        else:
-            parts.append(content[:300])
+        display_title = f"[YouTube] {title[:50]}"
+    else:
+        display_title = title[:60]
 
-    else:  # web
-        domain = capture.get("domain", "")
-        author = capture.get("author", "")
-        if author and author != domain:
-            parts.append(f"Article by {author} ({domain}):")
-        parts.append(content[:300])
+    # stats line
+    stats_parts = []
+    for k, label in [("views","播放"), ("likes","赞"), ("bookmarks","收藏")]:
+        v = meta.get(k, 0) or 0
+        if v: stats_parts.append(f"{v:,}{label}")
+    stats_line = "数据：" + "，".join(stats_parts) + "\n" if stats_parts else ""
 
-    return "\n".join(parts)[:max_len]
+    text = (
+        f"来源：{url} / {author} / {fetched_at}\n"
+        f"{stats_line}"
+        f"\n{content[:600]}"
+    )
 
-# ── dedup check (sqlite only; nmem dedup handled by the AI agent) ─────────────
+    pub_date = (meta.get("published_at") or fetched_at or "")[:10]
 
-def check_dedup_sqlite(url: str, db: sqlite_backend.SQLiteBackend) -> dict:
-    """Returns {"exists": bool, "similar": [...]}"""
-    return {"exists": db.exists(url), "similar": []}
+    return {
+        "title":       display_title,
+        "text":        text,
+        "unit_type":   "event" if url_type in ("twitter","youtube") else "fact",
+        "labels":      auto_labels(item),
+        "importance":  score_importance(item),
+        "event_start": pub_date or None,
+    }
 
 # ── main pipeline ─────────────────────────────────────────────────────────────
 
-def run(
-    url: str,
-    backend: str = "sqlite",
-    db_path: str = None,
-    whisper_model: str = "base",
-    json_output: bool = False,
-) -> dict:
-    """
-    Full capture pipeline.
-    Returns result dict suitable for AI agent consumption.
-    """
+def run(url: str, json_output: bool = False) -> dict:
+    url = normalise_url(url)
     result = {
-        "url":        url,
-        "status":     "ok",
-        "url_type":   None,
-        "title":      None,
-        "summary":    None,
-        "labels":     [],
-        "importance": 0.5,
-        "nmem_payload": None,   # filled when backend includes nmem
-        "dedup":      {"exists": False, "similar": []},
-        "error":      None,
+        "url": url, "status": "ok",
+        "title": None, "url_type": detect_type(url),
+        "nmem_payload": None, "error": None,
     }
 
-    # 1. fetch
     try:
-        capture = fetch(url, whisper_model=whisper_model)
-        result["url_type"] = capture.get("url_type")
-        result["title"]    = capture.get("title")
+        item = fetch(url)
+        result["url_type"]     = item.get("source_type", detect_type(url))
+        result["title"]        = item.get("title", url)
+        result["nmem_payload"] = build_nmem_payload(item)
+        result["raw"]          = item
     except Exception as e:
         result["status"] = "error"
         result["error"]  = str(e)
-        if json_output:
-            print(json.dumps(result, ensure_ascii=False, indent=2))
-        return result
 
-    # 2. auto-summary
-    summary = auto_summary(capture)
-    result["summary"] = summary
-
-    # 3. nmem formatting (always computed; AI agent decides whether to actually save)
-    nmem_payload = nmem_backend.format_for_nmem(capture, summary)
-    result["nmem_payload"] = nmem_payload
-    result["labels"]       = nmem_payload["labels"]
-    result["importance"]   = nmem_payload["importance"]
-
-    # 4. sqlite save (if requested)
-    if backend in ("sqlite", "both"):
-        db = sqlite_backend.SQLiteBackend(db_path)
-        dedup = check_dedup_sqlite(url, db)
-        result["dedup"] = dedup
-        if not dedup["exists"]:
-            save_capture = {**capture, **nmem_payload}
-            uid = db.save(save_capture)
-            result["sqlite_id"] = uid
-        db.close()
-
-    # 5. output
     if json_output:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
-        _print_human(result, capture)
+        _print_human(result)
 
     return result
 
-
-def _print_human(result: dict, capture: dict):
-    """Print a concise human-readable capture card."""
-    icon = {"twitter": "🐦", "youtube": "🎬", "web": "🌐"}.get(result["url_type"], "🔗")
-    title = result["title"] or result["url"]
-    labels = " ".join(f"#{l}" for l in result["labels"])
-    imp = result["importance"]
-    imp_star = "★★★" if imp >= 0.8 else "★★" if imp >= 0.65 else "★"
-
-    print(f"\n{icon} {title}")
-    print(f"   URL:    {result['url']}")
-    print(f"   Type:   {result['url_type']}")
-    print(f"   Labels: {labels}")
-    print(f"   Imp:    {imp_star} ({imp:.1f})")
-
-    stats = capture.get("stats", {})
-    if stats and any(stats.values()):
-        stat_str = " · ".join(
-            f"{k}={v:,}" for k, v in stats.items() if v
-        )
-        print(f"   Stats:  {stat_str}")
-
-    if result["url_type"] == "youtube":
-        method = capture.get("transcript_method", "")
-        dur    = capture.get("duration_secs", 0)
-        print(f"   Audio:  {dur//60} min · transcript via {method}")
-
-    print(f"\n   Summary:\n   {result['summary'][:300]}")
-
-    if result["dedup"].get("exists"):
-        print("\n   ⚠️  Already in local DB — skipped")
-    elif "sqlite_id" in result:
-        print(f"\n   ✅ Saved to SQLite [{result['sqlite_id']}]")
-
-    if result["nmem_payload"]:
-        print("\n   📋 nmem_payload ready (pass to nowledge_mem_save to index)")
+def _print_human(r: dict):
+    icon = {"twitter":"🐦","youtube":"🎬","web":"🌐"}.get(r["url_type"],"🔗")
+    print(f"\n{icon} {r['title'] or r['url']}")
+    print(f"   {r['url']}")
+    if r.get("error"):
+        print(f"   ❌ {r['error']}")
+        return
+    p = r.get("nmem_payload", {})
+    if p:
+        labels = " ".join(f"#{l}" for l in p.get("labels",[]))
+        imp = p.get("importance", 0.5)
+        star = "★★★" if imp>=0.8 else "★★" if imp>=0.65 else "★"
+        print(f"   {labels}  {star}")
+        print(f"   {p.get('text','')[:200]}")
+    print(f"\n   📋 nmem_payload ready → nowledge_mem_save()")
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
-def main():
-    p = argparse.ArgumentParser(description="link-capture: URL → knowledge")
-    p.add_argument("--url",           required=True, help="URL to capture")
-    p.add_argument("--backend",       default="sqlite",
-                   choices=["sqlite","nmem","both","none"],
-                   help="Storage backend (default: sqlite)")
-    p.add_argument("--db",            default=None,
-                   help="SQLite DB path (default: ~/.link-capture/captures.db)")
-    p.add_argument("--whisper-model", default="base",
-                   choices=["tiny","base","small","medium","large"],
-                   help="Whisper model for YouTube (default: base)")
-    p.add_argument("--json",          action="store_true",
-                   help="Output JSON (for AI agent consumption)")
-    args = p.parse_args()
-
-    run(
-        url           = args.url,
-        backend       = args.backend,
-        db_path       = args.db,
-        whisper_model = args.whisper_model,
-        json_output   = args.json,
-    )
-
 if __name__ == "__main__":
-    main()
+    p = argparse.ArgumentParser(description="OpenClaw Link Capture")
+    p.add_argument("--url",  required=True)
+    p.add_argument("--json", action="store_true", help="JSON output for AI agents")
+    args = p.parse_args()
+    run(args.url, json_output=args.json)
